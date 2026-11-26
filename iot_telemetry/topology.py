@@ -39,6 +39,9 @@ import time
 
 from mininet.log import setLogLevel, info
 from mininet.link import TCLink
+from mininet.node import Node
+import mininet.cli
+import mn_wifi.link
 from mn_wifi.net import Mininet_wifi
 from mn_wifi.cli import CLI
 
@@ -46,6 +49,60 @@ import config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PYTHON = sys.executable or "python3"
+
+
+# -------------------------------------------------------- compatibility ------
+# Two workarounds for Mininet-WiFi 2.7. They change nothing where they are not
+# needed, and make the lab work on Ubuntu 26.04 (kernel 7.0) and on slow VMs.
+#
+# 1. Mininet runs every command of a node through one shell, and that shell is
+#    not thread-safe. Mininet-WiFi's handover thread uses the station shells
+#    while the main thread (network start, CLI) may use them at the same time.
+#    That ends in "AssertionError: assert self.shell and not self.waiting" and
+#    a dead handover thread. A lock per node lets one command run at a time.
+# 2. Mininet-WiFi sends "iw dev staX-wlan0 connect" while the interface is
+#    still down ("Network is down (-100)" on kernel 7.0), ignores the error and
+#    never retries, so the station stays unassociated. Bring it up first.
+_NODE_LOCKS = {}
+_NODE_LOCKS_GUARD = threading.Lock()
+
+
+def node_lock(node):
+    with _NODE_LOCKS_GUARD:
+        lock = _NODE_LOCKS.get(id(node))
+        if lock is None:
+            lock = _NODE_LOCKS[id(node)] = threading.RLock()
+    return lock
+
+
+def _install_workarounds():
+    original_cmd = Node.cmd
+
+    def locked_cmd(self, *args, **kwargs):
+        with node_lock(self):
+            return original_cmd(self, *args, **kwargs)
+    Node.cmd = locked_cmd
+
+    original_default = mininet.cli.CLI.default
+
+    def locked_default(self, line):          # "sta1 iw dev ..." typed in the CLI
+        words = line.split()
+        node = self.mn.nameToNode.get(words[0]) if words else None
+        if node is None:
+            return original_default(self, line)
+        with node_lock(node):
+            return original_default(self, line)
+    mininet.cli.CLI.default = locked_default
+
+    original_connect = mn_wifi.link.IntfWireless.iw_connect
+
+    def connect_when_up(self, ap_intf):
+        self.pexec("ip link set %s up" % self.name)
+        return original_connect(self, ap_intf)
+    mn_wifi.link.IntfWireless.iw_connect = connect_when_up
+
+
+_install_workarounds()
 
 
 def parse_args():
@@ -98,8 +155,9 @@ def build_network(args):
     stations = []
     for name, (ip, sid, lane_y) in sorted(config.STATIONS.items()):
         params = {"ip": "%s/8" % ip, "mac": "00:00:00:00:00:%02x" % sid}
-        if args.scenario == "stationary":
-            params["position"] = "%d,%d,0" % (config.STATIONARY_X, lane_y)
+        # mobile sensors wait at the start of their path until they move
+        x = config.STATIONARY_X if args.scenario == "stationary" else config.PATH_START_X
+        params["position"] = "%d,%d,0" % (x, lane_y)
         stations.append(net.addStation(name, **params))
 
     ap_opts = {} if args.controller else {"failMode": "standalone"}
@@ -168,7 +226,9 @@ def wait_associated(stations, timeout=30):
             out = sta.pexec("iw dev %s-wlan0 link" % name)[0]
             if "Connected to" in out:
                 bssid = re.search(r"Connected to ([0-9a-f:]+)", out)
-                info("*** %s associated (%s)\n" % (name, bssid.group(1) if bssid else "?"))
+                ssid = re.search(r"SSID: (\S+)", out)
+                info("*** %s associated with %s (%s)\n" % (name, ssid.group(1) if ssid else "?",
+                                                         bssid.group(1) if bssid else "?"))
                 del pending[name]
         if pending:
             time.sleep(0.5)
